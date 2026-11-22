@@ -488,19 +488,24 @@ mod wasm {
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             let this = self.project();
-            let mut state = this.handle.task.state.borrow_mut();
-
-            if state.cancelled {
+            if this.handle.task.state.borrow().cancelled {
                 return Poll::Ready(());
             }
 
+            // The state is not borrowed while the task is polled, so the
+            // task can use a handle to itself, or the `JoinSet` it is in.
             match this.fut.poll(cx) {
                 Poll::Ready(value) => {
                     let _ = this.handle.task.result.borrow_mut().insert(value);
-                    state.complete();
+                    this.handle.task.state.borrow_mut().complete();
                     Poll::Ready(())
                 }
                 Poll::Pending => {
+                    let mut state = this.handle.task.state.borrow_mut();
+                    // The task may have been aborted while it was polled.
+                    if state.cancelled {
+                        return Poll::Ready(());
+                    }
                     state.register_spawn_fn(cx);
                     Poll::Pending
                 }
@@ -619,14 +624,21 @@ mod wasm {
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        },
+        task::{Context, Waker},
+        time::Duration,
+    };
 
     #[cfg(not(wasm_browser))]
     use tokio::test;
     #[cfg(wasm_browser)]
     use wasm_bindgen_test::wasm_bindgen_test as test;
 
-    use crate::task;
+    use crate::{future::now_or_never, task};
 
     #[test]
     async fn task_abort() {
@@ -677,5 +689,50 @@ mod test {
         }
         assert!(has_err);
         assert!(has_ok);
+    }
+
+    /// A running task can abort itself, as it can with tokio. It is
+    /// cancelled, and dropped even though nothing would wake it again.
+    #[test]
+    async fn task_aborts_itself() {
+        struct SetOnDrop(Arc<AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let own_handle = Arc::new(Mutex::new(None::<task::AbortHandle>));
+        let handle = task::spawn({
+            let own_handle = own_handle.clone();
+            let set_on_drop = SetOnDrop(dropped.clone());
+            async move {
+                let _set_on_drop = set_on_drop;
+                own_handle.lock().unwrap().take().unwrap().abort();
+                std::future::pending::<()>().await;
+            }
+        });
+        *own_handle.lock().unwrap() = Some(handle.abort_handle());
+        assert!(handle.await.err().unwrap().is_cancelled());
+        crate::time::sleep(Duration::from_millis(10)).await;
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// A task in a `JoinSet` can poll that `JoinSet` while it runs.
+    #[test]
+    async fn join_set_polled_by_its_own_task() {
+        let set = Arc::new(Mutex::new(task::JoinSet::new()));
+        set.lock().unwrap().spawn({
+            let set = set.clone();
+            async move {
+                let mut set = set.lock().unwrap();
+                let cx = &mut Context::from_waker(Waker::noop());
+                assert!(set.poll_join_next(cx).is_pending());
+            }
+        });
+        crate::time::sleep(Duration::from_millis(10)).await;
+        let joined = now_or_never(set.lock().unwrap().join_next());
+        assert!(matches!(joined, Some(Some(Ok(())))));
     }
 }
